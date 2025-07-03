@@ -1,0 +1,259 @@
+name: Buildtest
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, os: 24, runner: ubuntu-24.04 }
+          - { arch: arm64, os: 24, runner: ubuntu-24.04-arm }
+          - { arch: x64, os: 22, runner: ubuntu-22.04 }
+          - { arch: arm64, os: 22, runner: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-dev libusb-1.0-0-dev
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: make tests
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp `pkg-config --variable=libdir libusb-1.0`/libusb-1.0.so.0 dist
+          chmod 0644 dist/*
+          cp qdl dist
+          patchelf --set-rpath '$ORIGIN' dist/qdl
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-binary-ubuntu-${{matrix.os}}-${{ matrix.arch }}
+          path: dist/*
+
+
+  build-mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sys: macos-14, arch: arm64 }
+          - { sys: macos-13, arch: intel }
+    runs-on: ${{ matrix.sys }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          brew install libxml2
+
+      - name: Build
+        run: make
+
+      - name: Run tests
+        run: make tests
+
+      - name: Package
+        run: |
+          set -x
+          mkdir dist
+          cp `pkg-config --variable=libdir libusb-1.0`/libusb-1.0.0.dylib dist
+          cp `pkg-config --variable=libdir liblzma`/liblzma.5.dylib dist
+          chmod 0644 dist/*
+          cp qdl dist
+
+          if uname -a | grep -q arm64; then
+            LIBUSB_DIR=/opt/homebrew/opt/libusb/lib
+            LIBLZMA_DIR=/usr/lib
+          else
+            LIBUSB_DIR=/usr/local/opt/libusb/lib
+            LIBLZMA_DIR=/usr/local/opt/xz/lib
+          fi
+
+          install_name_tool -add_rpath @executable_path dist/qdl
+          install_name_tool -change $LIBUSB_DIR/libusb-1.0.0.dylib @rpath/libusb-1.0.0.dylib dist/qdl
+          install_name_tool -change $LIBLZMA_DIR/liblzma.5.dylib @rpath/liblzma.5.dylib dist/qdl
+          otool -L dist/qdl
+          dist/qdl || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-binary-macos-${{ matrix.arch }}
+          path: dist/*
+
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { sys: windows-latest, arch: x64 }
+          - { sys: windows-11-arm, arch: arm64 }
+    runs-on: ${{ matrix.sys }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >
+            base-devel
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-libusb
+
+      - name: Build
+        run: make
+        shell: msys2 {0}
+
+      - name: Run tests
+        run: make tests
+        shell: msys2 {0}
+
+      - name: Package Standalone
+        shell: pwsh
+        run: |
+          $MSYS2_LOCATION = "${{ steps.msys2.outputs.msys2-location }}"
+          $BIN_DIR = Join-Path $MSYS2_LOCATION "mingw64\bin"
+          $DistDir = "qdl-standalone"
+          
+          # Create standalone directory
+          if (Test-Path $DistDir) { Remove-Item $DistDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $DistDir | Out-Null
+
+          # Copy all executables
+          Copy-Item "qdl.exe" $DistDir
+          Copy-Item "qdl-ramdump.exe" $DistDir
+          Copy-Item "ks.exe" $DistDir
+          
+          # Copy required DLLs
+          Copy-Item (Join-Path $BIN_DIR "libxml2-2.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libusb-1.0.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "liblzma-5.dll") $DistDir
+          Copy-Item (Join-Path $BIN_DIR "libiconv-2.dll") $DistDir
+          
+          # Copy README
+          Copy-Item "qdl-standalone\README.txt" $DistDir -ErrorAction SilentlyContinue
+          
+          # Create README if it doesn't exist
+          if (-not (Test-Path (Join-Path $DistDir "README.txt"))) {
+            @"
+QDL Standalone Package for Windows
+===================================
+
+This package contains a fully self-contained version of QDL (Qualcomm Download) 
+that can run on any Windows system without requiring additional dependencies.
+
+CONTENTS:
+---------
+qdl.exe         - Main QDL tool for flashing Qualcomm devices
+qdl-ramdump.exe - RAM dump utility for device recovery
+ks.exe          - KS utility for device operations
+libusb-1.0.dll  - USB communication library
+libxml2-2.dll   - XML parsing library
+libiconv-2.dll  - Character encoding conversion library
+liblzma-5.dll   - Compression library
+
+USAGE:
+------
+1. Extract this entire folder to any location on your Windows system
+2. Open Command Prompt or PowerShell
+3. Navigate to the extracted folder
+4. Run: qdl.exe --help
+
+EXAMPLE:
+--------
+To flash a device in EDL mode:
+qdl.exe prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+
+To list help and options:
+qdl.exe --help
+
+REQUIREMENTS:
+-------------
+- Windows 7 or later (64-bit)
+- Device must be in Emergency Download (EDL) mode
+- Appropriate device drivers installed
+
+NOTES:
+------
+- This package is completely portable - no installation required
+- All dependencies are included in this folder
+- Keep all files together in the same directory
+- Built with MSYS2/MinGW64 on Windows
+
+For more information, visit: https://github.com/linux-msm/qdl 
+"@ | Out-File -FilePath (Join-Path $DistDir "README.txt") -Encoding UTF8
+          }
+
+      - name: Create Zip Archive
+        shell: pwsh
+        run: |
+          $VERSION = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "$(git describe --dirty --always --tags)" }
+          $ZipName = "qdl-standalone-windows-${{ matrix.arch }}-${VERSION}.zip"
+          Compress-Archive -Path "qdl-standalone\*" -DestinationPath $ZipName
+          
+          # Also create a generic zip for latest builds
+          if (${{ matrix.arch }} -eq "x64") {
+            Copy-Item $ZipName "qdl-standalone-windows.zip"
+          }
+
+      - name: Upload Standalone Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-standalone-windows-${{ matrix.arch }}
+          path: |
+            qdl-standalone/
+            qdl-standalone-windows*.zip
+
+      - name: Upload artifact (legacy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-binary-windows-${{ matrix.arch }}
+          path: qdl-standalone/
+
+  # Create release on tags
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build-linux, build-mac, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            qdl-standalone-windows-x64/*.zip
+            qdl-standalone-windows-arm64/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+
