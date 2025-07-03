@@ -1,0 +1,106 @@
+name: Release
+
+on:
+    pull_request:
+    push:
+
+jobs:
+  upload-release-assets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest successful build workflow run
+        id: get-run
+        run: |
+          # Get the commit SHA for this release
+          COMMIT_SHA="${{ github.event.release.target_commitish }}"
+          echo "Release commit: $COMMIT_SHA"
+          
+          # Find the most recent successful build workflow run for this commit
+          RUN_ID=$(gh api repos/${{ github.repository }}/actions/workflows/build.yml/runs \
+            --jq ".workflow_runs[] | select(.head_sha == \"$COMMIT_SHA\" and .conclusion == \"success\") | .id" \
+            | head -1)
+          
+          if [ -z "$RUN_ID" ]; then
+            echo "No successful build found for commit $COMMIT_SHA"
+            exit 1
+          fi
+          
+          echo "Found build run ID: $RUN_ID"
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all artifacts
+        run: |
+          # Create downloads directory
+          mkdir -p downloads
+          
+          # Download all artifacts from the build run
+          gh api repos/${{ github.repository }}/actions/runs/${{ steps.get-run.outputs.run_id }}/artifacts \
+            --jq '.artifacts[] | select(.name | startswith("qdl-binary-")) | {name: .name, url: .archive_download_url}' \
+            > artifacts.json
+          
+          # Download each artifact
+          while IFS= read -r artifact; do
+            NAME=$(echo "$artifact" | jq -r '.name')
+            URL=$(echo "$artifact" | jq -r '.url')
+            echo "Downloading $NAME..."
+            gh api "$URL" > "downloads/${NAME}.zip"
+          done < <(jq -c '.' artifacts.json)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract and prepare release assets
+        run: |
+          mkdir -p release-assets
+          cd downloads
+          
+          # Extract each artifact and prepare for release
+          for artifact_zip in *.zip; do
+            artifact_name="${artifact_zip%.zip}"
+            echo "Processing $artifact_name..."
+            
+            # Create directory for this artifact
+            mkdir -p "$artifact_name"
+            unzip -q "$artifact_zip" -d "$artifact_name"
+            
+            # Determine the platform and create appropriate archive
+            if [[ "$artifact_name" == *"windows"* ]]; then
+              # For Windows, create a zip file
+              cd "$artifact_name"
+              zip -r "../release-assets/${artifact_name}.zip" .
+              cd ..
+            else
+              # For Linux and macOS, create a tar.gz file
+              cd "$artifact_name"
+              tar -czf "../release-assets/${artifact_name}.tar.gz" .
+              cd ..
+            fi
+          done
+
+      - name: Upload assets to release
+        run: |
+          cd release-assets
+          
+          # Upload each prepared asset to the release
+          for asset in *; do
+            echo "Uploading $asset to release..."
+            gh release upload ${{ github.event.release.tag_name }} "$asset" --clobber
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update release with standalone Windows package
+        run: |
+          # If the standalone Windows package exists, add it to the release too
+          if [ -f "qdl-standalone-windows.zip" ]; then
+            echo "Adding standalone Windows package to release..."
+            gh release upload ${{ github.event.release.tag_name }} "qdl-standalone-windows.zip" --clobber
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
