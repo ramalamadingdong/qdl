@@ -131,25 +131,135 @@ jobs:
         run: make tests
         shell: msys2 {0}
 
-      - name: Package
+      - name: Package Standalone
         shell: pwsh
         run: |
           $MSYS2_LOCATION = "${{ steps.msys2.outputs.msys2-location }}"
           $BIN_DIR = Join-Path $MSYS2_LOCATION "mingw64\bin"
-          $DistDir = "dist"
+          $DistDir = "qdl-standalone"
+          
+          # Create standalone directory
+          if (Test-Path $DistDir) { Remove-Item $DistDir -Recurse -Force }
           New-Item -ItemType Directory -Path $DistDir | Out-Null
 
-          Copy-Item (Join-Path $BIN_DIR "zlib1.dll") $DistDir
+          # Copy all executables
+          Copy-Item "qdl.exe" $DistDir
+          Copy-Item "qdl-ramdump.exe" $DistDir
+          Copy-Item "ks.exe" $DistDir
+          
+          # Copy required DLLs
           Copy-Item (Join-Path $BIN_DIR "libxml2-2.dll") $DistDir
           Copy-Item (Join-Path $BIN_DIR "libusb-1.0.dll") $DistDir
           Copy-Item (Join-Path $BIN_DIR "liblzma-5.dll") $DistDir
           Copy-Item (Join-Path $BIN_DIR "libiconv-2.dll") $DistDir
+          
+          # Copy README
+          Copy-Item "qdl-standalone\README.txt" $DistDir -ErrorAction SilentlyContinue
+          
+          # Create README if it doesn't exist
+          if (-not (Test-Path (Join-Path $DistDir "README.txt"))) {
+            @"
+QDL Standalone Package for Windows
+===================================
 
-          Copy-Item "qdl.exe" $DistDir
+This package contains a fully self-contained version of QDL (Qualcomm Download) 
+that can run on any Windows system without requiring additional dependencies.
 
-      - name: Upload artifact
+CONTENTS:
+---------
+qdl.exe         - Main QDL tool for flashing Qualcomm devices
+qdl-ramdump.exe - RAM dump utility for device recovery
+ks.exe          - KS utility for device operations
+libusb-1.0.dll  - USB communication library
+libxml2-2.dll   - XML parsing library
+libiconv-2.dll  - Character encoding conversion library
+liblzma-5.dll   - Compression library
+
+USAGE:
+------
+1. Extract this entire folder to any location on your Windows system
+2. Open Command Prompt or PowerShell
+3. Navigate to the extracted folder
+4. Run: qdl.exe --help
+
+EXAMPLE:
+--------
+To flash a device in EDL mode:
+qdl.exe prog_firehose_ddr.elf rawprogram*.xml patch*.xml
+
+To list help and options:
+qdl.exe --help
+
+REQUIREMENTS:
+-------------
+- Windows 7 or later (64-bit)
+- Device must be in Emergency Download (EDL) mode
+- Appropriate device drivers installed
+
+NOTES:
+------
+- This package is completely portable - no installation required
+- All dependencies are included in this folder
+- Keep all files together in the same directory
+- Built with MSYS2/MinGW64 on Windows
+
+For more information, visit: https://github.com/linux-msm/qdl 
+"@ | Out-File -FilePath (Join-Path $DistDir "README.txt") -Encoding UTF8
+          }
+
+      - name: Create Zip Archive
+        shell: pwsh
+        run: |
+          $VERSION = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "$(git describe --dirty --always --tags)" }
+          $ZipName = "qdl-standalone-windows-${{ matrix.arch }}-${VERSION}.zip"
+          Compress-Archive -Path "qdl-standalone\*" -DestinationPath $ZipName
+          
+          # Also create a generic zip for latest builds
+          if (${{ matrix.arch }} -eq "x64") {
+            Copy-Item $ZipName "qdl-standalone-windows.zip"
+          }
+
+      - name: Upload Standalone Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdl-standalone-windows-${{ matrix.arch }}
+          path: |
+            qdl-standalone/
+            qdl-standalone-windows*.zip
+
+      - name: Upload artifact (legacy)
         uses: actions/upload-artifact@v4
         with:
           name: qdl-binary-windows-${{ matrix.arch }}
-          path: dist/*
+          path: qdl-standalone/
+
+  # Create release on tags
+  release:
+    if: github.event_name == 'push'
+    needs: [build-linux, build-mac, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            qdl-standalone-windows-x64/*.zip
+            qdl-standalone-windows-arm64/*.zip
+            qdl-binary-ubuntu-24.04-x64/*.zip
+            qdl-binary-ubuntu-24.04-arm64/*.zip
+            qdl-binary-ubuntu-22.04-x64/*.zip
+            qdl-binary-ubuntu-22.04-arm64/*.zip
+            qdl-binary-macos-arm64/*.zip
+            qdl-binary-macos-intel/*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: false
 
